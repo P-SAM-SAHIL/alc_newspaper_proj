@@ -1,0 +1,1 @@
+# alc_newspaper_proj
