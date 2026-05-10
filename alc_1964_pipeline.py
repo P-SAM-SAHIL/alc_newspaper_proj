@@ -1,19 +1,33 @@
 """
-English A La Carte (ALC) embedding pipeline for the 1964 historical newspaper data.
+English A La Carte (ALC) embedding pipeline for yearly historical newspaper data.
 
 Input CSV columns expected:
 article_id,date,newspaper_name,headline,article,LCCN,State,County,City
 
 Example:
-python alc_1964_pipeline.py ^
-  --csv cleaned_1964.csv ^
+python alc_year_pipeline.py ^
+  --csv cleaned_1963.csv ^
+  --year 1963 ^
   --fasttext cc.en.300.bin ^
   --dict-json dictionaries.json ^
-  --group-col State ^
-  --groups Mississippi "New York" California ^
-  --out-dir outputs_1964 ^
+  --out-dir outputs ^
   --window-size 5 ^
   --min-count 20
+
+If a reusable ALC bundle already exists, pass it explicitly:
+python alc_year_pipeline.py ^
+  --csv cleaned_1963.csv ^
+  --year 1963 ^
+  --fasttext cc.en.300.bin ^
+  --alc-weights outputs/global_alc_vectors_1963.npz ^
+  --out-dir outputs
+
+When --alc-weights is omitted, the script automatically looks for:
+<out-dir>/global_alc_vectors_{year}.npz
+
+The reusable .npz bundle produced by this script includes the ALC transformation
+matrix, global vocabulary, counts, and global ALC vectors. Older .npz files that
+do not contain the matrix cannot be used as weights for local transformations.
 
 Dictionary JSON format:
 {
@@ -29,15 +43,21 @@ Dictionary JSON format:
 
 If --dict-json is omitted, the script uses the built-in dictionaries from the
 project prompt.
+
+Final analysis output:
+state_year_bias_table_{year}.csv
+
+Columns:
+State,Year,Diff bias score,Bias score_group1,Bias score_group2,Bias concept
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import string
-import csv
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -102,15 +122,26 @@ MASKED_TERM_EXPANSIONS = {
 }
 
 
-BIAS_TESTS: List[Tuple[str, str, str, str]] = [
-    ("BLACK_NEGATIVE_MINUS_WHITE_NEGATIVE", "BLACK", "WHITE", "NEGATIVE"),
-    ("BLACK_POSITIVE_MINUS_WHITE_POSITIVE", "BLACK", "WHITE", "POSITIVE"),
-    ("BLACK_RICH_MINUS_WHITE_RICH", "BLACK", "WHITE", "RICH"),
-    ("BLACK_POOR_MINUS_WHITE_POOR", "BLACK", "WHITE", "POOR"),
-    ("WOMEN_POSITIVE_MINUS_MEN_POSITIVE", "WOMEN", "MEN", "POSITIVE"),
-    ("WOMEN_NEGATIVE_MINUS_MEN_NEGATIVE", "WOMEN", "MEN", "NEGATIVE"),
-    ("POOR_NEGATIVE_MINUS_RICH_NEGATIVE", "POOR", "RICH", "NEGATIVE"),
-    ("RICH_POSITIVE_MINUS_POOR_POSITIVE", "RICH", "POOR", "POSITIVE"),
+# Bias concept label, group 1 concept, group 2 concept, attribute concept.
+BIAS_CONTRASTS: List[Tuple[str, str, str, str]] = [
+    ("Black-negative/White-negative", "BLACK", "WHITE", "NEGATIVE"),
+    ("Black-positive/White-positive", "BLACK", "WHITE", "POSITIVE"),
+    ("Black-rich/White-rich", "BLACK", "WHITE", "RICH"),
+    ("Black-poor/White-poor", "BLACK", "WHITE", "POOR"),
+    ("Men-positive/Women-positive", "MEN", "WOMEN", "POSITIVE"),
+    ("Men-negative/Women-negative", "MEN", "WOMEN", "NEGATIVE"),
+    ("Rich-positive/Poor-positive", "RICH", "POOR", "POSITIVE"),
+    ("Rich-negative/Poor-negative", "RICH", "POOR", "NEGATIVE"),
+]
+
+
+BIAS_TABLE_FIELDS = [
+    "State",
+    "Year",
+    "Diff bias score",
+    "Bias score_group1",
+    "Bias score_group2",
+    "Bias concept",
 ]
 
 
@@ -237,6 +268,12 @@ class EnglishNormalizer:
         return best_term if best_dist <= self.fuzzy_max_distance else token
 
 
+def normalize_group_value(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def read_text_rows(
     csv_path: Path,
     article_col: str,
@@ -253,10 +290,25 @@ def read_text_rows(
             raise ValueError(f"CSV must contain group column '{group_col}'.")
 
         for row in reader:
-            group = str(row.get(group_col, "")) if group_col else None
+            group = normalize_group_value(row.get(group_col, "")) if group_col else None
             if groups and group not in groups:
                 continue
             yield row.get(article_col, ""), group
+
+
+def discover_groups(csv_path: Path, group_col: str, article_col: str) -> List[str]:
+    groups: Set[str] = set()
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or article_col not in reader.fieldnames:
+            raise ValueError(f"CSV must contain article column '{article_col}'.")
+        if group_col not in reader.fieldnames:
+            raise ValueError(f"CSV must contain group column '{group_col}'.")
+        for row in reader:
+            group = normalize_group_value(row.get(group_col, ""))
+            if group:
+                groups.add(group)
+    return sorted(groups, key=lambda item: item.lower())
 
 
 def iter_windows(tokens: Sequence[str], window_size: int) -> Iterator[Tuple[str, List[str]]]:
@@ -324,7 +376,6 @@ class GlobalALCResult:
     matrix: np.ndarray
     vocab: List[str]
     counts: Dict[str, int]
-    context_vectors: np.ndarray
     alc_vectors: np.ndarray
 
 
@@ -445,7 +496,6 @@ class ALaCarteEnglish:
             matrix=self.A,
             vocab=global_vocab,
             counts={word: int(context_counts[word]) for word in global_vocab},
-            context_vectors=C,
             alc_vectors=alc,
         )
         self.global_result = result
@@ -453,6 +503,10 @@ class ALaCarteEnglish:
 
     def load_matrix(self, matrix_path: Path) -> None:
         self.A = np.load(matrix_path).astype(np.float32)
+
+    def load_global_result(self, result: GlobalALCResult) -> None:
+        self.A = result.matrix.astype(np.float32)
+        self.global_result = result
 
     def local_context_vectors(
         self,
@@ -507,28 +561,6 @@ class ALaCarteEnglish:
         vec = context_vector.reshape(1, -1).astype(np.float32) @ self.A.T
         return l2_normalize_matrix(vec)[0].astype(np.float32)
 
-    def nearest_neighbors(
-        self,
-        query_vector: np.ndarray,
-        topn: int = 10,
-        exclude: Optional[Set[str]] = None,
-    ) -> List[Tuple[str, float]]:
-        if self.global_result is None:
-            raise ValueError("Global ALC vectors were not built; nearest-neighbor validation is unavailable.")
-        exclude = exclude or set()
-        q = query_vector / max(float(np.linalg.norm(query_vector)), 1e-12)
-        sims = self.global_result.alc_vectors @ q
-        if exclude:
-            for word in exclude:
-                try:
-                    idx = self.global_result.vocab.index(word)
-                    sims[idx] = -np.inf
-                except ValueError:
-                    pass
-        top_idx = np.argpartition(-sims, kth=min(topn, len(sims) - 1))[:topn]
-        top_idx = top_idx[np.argsort(-sims[top_idx])]
-        return [(self.global_result.vocab[i], float(sims[i])) for i in top_idx]
-
 
 def expand_masked_terms(terms: Sequence[str]) -> List[str]:
     expanded: List[str] = []
@@ -557,12 +589,6 @@ def clean_dictionary_terms(
     return dictionaries
 
 
-def load_dictionary_json(path: Path, normalizer: EnglishNormalizer) -> Dict[str, List[str]]:
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-    return clean_dictionary_terms(raw, normalizer)
-
-
 def flatten_dictionary_terms(dictionaries: Mapping[str, Sequence[str]]) -> Set[str]:
     return {term for terms in dictionaries.values() for term in terms}
 
@@ -575,10 +601,14 @@ def raw_dictionary_terms(raw: Mapping[str, Sequence[str]]) -> Set[str]:
 
 
 def save_matrix_and_metadata(out_dir: Path, result: GlobalALCResult, args: argparse.Namespace) -> None:
-    np.save(out_dir / "A_1964_news.npy", result.matrix)
-    with (out_dir / "A_1964_news_metadata.json").open("w", encoding="utf-8") as f:
+    matrix_path = out_dir / f"A_{args.year}_news.npy"
+    metadata_path = out_dir / f"A_{args.year}_news_metadata.json"
+
+    np.save(matrix_path, result.matrix)
+    with metadata_path.open("w", encoding="utf-8") as f:
         json.dump(
             {
+                "year": str(args.year),
                 "embedding_dim": int(result.matrix.shape[0]),
                 "window_size": args.window_size,
                 "min_count": args.min_count,
@@ -592,36 +622,58 @@ def save_matrix_and_metadata(out_dir: Path, result: GlobalALCResult, args: argpa
         )
 
 
-def save_global_alc_vectors(out_dir: Path, result: GlobalALCResult) -> None:
+def save_global_alc_bundle(path: Path, result: GlobalALCResult) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
-        out_dir / "global_alc_vectors_1964.npz",
+        path,
+        matrix=result.matrix.astype(np.float32),
         vocab=np.asarray(result.vocab),
         counts=np.asarray([result.counts[w] for w in result.vocab], dtype=np.int32),
-        vectors=result.alc_vectors,
+        vectors=result.alc_vectors.astype(np.float32),
     )
 
 
-def write_csv_rows(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
+def load_global_alc_bundle(path: Path) -> GlobalALCResult:
+    with np.load(path, allow_pickle=False) as data:
+        files = set(data.files)
+        if "matrix" not in files:
+            raise ValueError(
+                f"{path} does not contain an ALC transformation matrix. "
+                "Use a bundle produced by this script or pass --matrix with an A_*.npy file."
+            )
+        if "vocab" not in files or "counts" not in files or "vectors" not in files:
+            raise ValueError(f"{path} must contain matrix, vocab, counts, and vectors arrays.")
 
-    fieldnames: List[str] = []
-    seen: Set[str] = set()
-    for row in rows:
-        for key in row.keys():
-            if key not in seen:
-                seen.add(key)
-                fieldnames.append(key)
+        matrix = data["matrix"].astype(np.float32)
+        vocab = [str(word) for word in data["vocab"].tolist()]
+        counts_array = data["counts"].astype(np.int64)
+        vectors = data["vectors"].astype(np.float32)
+
+    counts = {word: int(counts_array[idx]) for idx, word in enumerate(vocab)}
+    return GlobalALCResult(matrix=matrix, vocab=vocab, counts=counts, alc_vectors=vectors)
+
+
+def write_csv_rows(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    fieldnames: Optional[Sequence[str]] = None,
+) -> None:
+    if fieldnames is None:
+        fieldnames = []
+        seen: Set[str] = set()
+        for row in rows:
+            for key in row.keys():
+                if key not in seen:
+                    seen.add(key)
+                    fieldnames.append(key)
 
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=list(fieldnames))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def save_local_word_embeddings(
-    out_dir: Path,
+def transform_local_word_embeddings(
     pipeline: ALaCarteEnglish,
     local_contexts: Mapping[str, Mapping[str, Tuple[np.ndarray, int]]],
     dictionaries: Mapping[str, Sequence[str]],
@@ -632,18 +684,11 @@ def save_local_word_embeddings(
             concept_by_word[word] = concept
 
     transformed: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
-    rows: List[Dict[str, object]] = []
     for group, word_map in local_contexts.items():
         transformed[group] = defaultdict(dict)
-        for word, (context_vec, count) in word_map.items():
+        for word, (context_vec, _count) in word_map.items():
             concept = concept_by_word.get(word, "UNKNOWN")
-            alc_vec = pipeline.transform_context(context_vec)
-            transformed[group][concept][word] = alc_vec
-            row = {"group": group, "concept": concept, "word": word, "count": count}
-            row.update({f"dim_{i}": float(v) for i, v in enumerate(alc_vec)})
-            rows.append(row)
-
-    write_csv_rows(out_dir / "localized_word_alc_embeddings.csv", rows)
+            transformed[group][concept][word] = pipeline.transform_context(context_vec)
     return transformed
 
 
@@ -654,106 +699,49 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
-def build_and_save_concept_vectors(
-    out_dir: Path,
+def build_concept_vectors(
     transformed: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
 ) -> Dict[str, Dict[str, np.ndarray]]:
     concept_vectors: Dict[str, Dict[str, np.ndarray]] = {}
-    vector_rows: List[Dict[str, object]] = []
-    score_rows: List[Dict[str, object]] = []
-    bias_rows: List[Dict[str, object]] = []
-
     for group, concept_map in transformed.items():
         concept_vectors[group] = {}
         for concept, word_vecs in concept_map.items():
             if not word_vecs:
                 continue
             mat = np.vstack(list(word_vecs.values()))
-            concept_vec = l2_normalize_vector(mat.mean(axis=0)).astype(np.float32)
-            concept_vectors[group][concept] = concept_vec
-            row = {"group": group, "concept": concept, "n_words_present": len(word_vecs)}
-            row.update({f"dim_{i}": float(v) for i, v in enumerate(concept_vec)})
-            vector_rows.append(row)
-
-        concepts = sorted(concept_vectors[group])
-        for i, concept_a in enumerate(concepts):
-            for concept_b in concepts[i + 1 :]:
-                score_rows.append(
-                    {
-                        "group": group,
-                        "concept_a": concept_a,
-                        "concept_b": concept_b,
-                        "cosine_similarity": cosine(
-                            concept_vectors[group][concept_a],
-                            concept_vectors[group][concept_b],
-                        ),
-                    }
-                )
-
-        for test_name, concept_a, concept_b, attribute in BIAS_TESTS:
-            if (
-                concept_a not in concept_vectors[group]
-                or concept_b not in concept_vectors[group]
-                or attribute not in concept_vectors[group]
-            ):
-                continue
-            sim_a = cosine(concept_vectors[group][concept_a], concept_vectors[group][attribute])
-            sim_b = cosine(concept_vectors[group][concept_b], concept_vectors[group][attribute])
-            bias_rows.append(
-                {
-                    "group": group,
-                    "bias_test": test_name,
-                    "concept_a": concept_a,
-                    "concept_b": concept_b,
-                    "attribute": attribute,
-                    "cosine_a_attribute": sim_a,
-                    "cosine_b_attribute": sim_b,
-                    "difference_a_minus_b": sim_a - sim_b,
-                    "interpretation": (
-                        f"positive means {concept_a} is closer to {attribute} than {concept_b}"
-                    ),
-                }
-            )
-
-    write_csv_rows(out_dir / "localized_concept_vectors.csv", vector_rows)
-    write_csv_rows(out_dir / "concept_cosine_similarity_scores.csv", score_rows)
-    write_csv_rows(out_dir / "bias_contrast_scores.csv", bias_rows)
+            concept_vectors[group][concept] = l2_normalize_vector(mat.mean(axis=0)).astype(np.float32)
     return concept_vectors
 
 
-def save_validation_neighbors(
-    out_dir: Path,
-    pipeline: ALaCarteEnglish,
-    transformed: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
-    validation_words: Sequence[str],
-    topn: int,
-) -> None:
+def build_bias_table_rows(
+    concept_vectors: Mapping[str, Mapping[str, np.ndarray]],
+    year: str,
+) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    validation_set = set(validation_words)
-    for group, concept_map in transformed.items():
-        for concept, word_map in concept_map.items():
-            for word, vec in word_map.items():
-                if validation_set and word not in validation_set:
-                    continue
-                neighbors = pipeline.nearest_neighbors(vec, topn=topn, exclude={word})
-                for rank, (neighbor, similarity) in enumerate(neighbors, start=1):
-                    rows.append(
-                        {
-                            "group": group,
-                            "concept": concept,
-                            "query_word": word,
-                            "rank": rank,
-                            "neighbor": neighbor,
-                            "cosine_similarity": similarity,
-                        }
-                    )
-    if rows:
-        write_csv_rows(out_dir / "validation_nearest_neighbors.csv", rows)
+    for state in sorted(concept_vectors, key=lambda item: item.lower()):
+        vectors = concept_vectors[state]
+        for label, concept_a, concept_b, attribute in BIAS_CONTRASTS:
+            if concept_a not in vectors or concept_b not in vectors or attribute not in vectors:
+                continue
+            score_a = cosine(vectors[concept_a], vectors[attribute])
+            score_b = cosine(vectors[concept_b], vectors[attribute])
+            rows.append(
+                {
+                    "State": state,
+                    "Year": year,
+                    "Diff bias score": round(score_a - score_b, 6),
+                    "Bias score_group1": round(score_a, 6),
+                    "Bias score_group2": round(score_b, 6),
+                    "Bias concept": label,
+                }
+            )
+    return rows
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="1964 English ALC embedding pipeline.")
-    parser.add_argument("--csv", type=Path, required=True, help="Cleaned 1964 CSV file.")
+    parser = argparse.ArgumentParser(description="Yearly English ALC state-bias table pipeline.")
+    parser.add_argument("--csv", type=Path, required=True, help="Cleaned yearly CSV file.")
+    parser.add_argument("--year", required=True, help="Year label to write into outputs, for example 1963.")
     parser.add_argument("--fasttext", type=Path, required=True, help="English fastText .bin/.vec/.txt/.kv path.")
     parser.add_argument(
         "--dict-json",
@@ -761,10 +749,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional concept dictionary JSON file. Uses built-in project dictionaries if omitted.",
     )
-    parser.add_argument("--out-dir", type=Path, default=Path("alc_outputs_1964"))
+    parser.add_argument("--out-dir", type=Path, default=Path("alc_outputs"))
     parser.add_argument("--article-col", default="article")
     parser.add_argument("--group-col", default="State", choices=["State", "County", "City"])
-    parser.add_argument("--groups", nargs="+", required=True, help="Geographic values to analyze.")
+    parser.add_argument(
+        "--groups",
+        nargs="*",
+        default=None,
+        help="Optional geographic values to analyze. If omitted, all values in --group-col are discovered.",
+    )
     parser.add_argument("--window-size", type=int, default=5)
     parser.add_argument("--min-count", type=int, default=20)
     parser.add_argument("--chunksize", type=int, default=20_000)
@@ -772,18 +765,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-regression-words", type=int, default=100_000)
     parser.add_argument("--max-global-alc-words", type=int, default=200_000)
     parser.add_argument("--fasttext-limit", type=int, default=None, help="Only applies to .vec/.txt models.")
-    parser.add_argument("--matrix", type=Path, default=None, help="Existing A_1964_news.npy to reuse.")
+    parser.add_argument("--matrix", type=Path, default=None, help="Legacy existing A_{year}_news.npy to reuse.")
+    parser.add_argument(
+        "--alc-weights",
+        type=Path,
+        default=None,
+        help="Existing or desired global_alc_vectors_{year}.npz bundle. If missing, it is trained and saved.",
+    )
     parser.add_argument("--enable-fuzzy", action="store_true", help="Fuzzy-repair OCR variants of dictionary words.")
     parser.add_argument("--fuzzy-max-distance", type=int, default=1)
-    parser.add_argument("--validation-words", nargs="*", default=[], help="Dictionary words for nearest-neighbor checks.")
-    parser.add_argument("--neighbor-topn", type=int, default=10)
-    parser.add_argument("--save-global-alc", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    args.year = str(args.year).strip()
+    if not args.year:
+        raise ValueError("--year cannot be empty.")
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    weights_path = args.alc_weights or (args.out_dir / f"global_alc_vectors_{args.year}.npz")
 
     if args.dict_json:
         with args.dict_json.open("r", encoding="utf-8") as f:
@@ -798,14 +799,18 @@ def main() -> None:
         fuzzy_max_distance=args.fuzzy_max_distance,
         enable_fuzzy=args.enable_fuzzy,
     )
-    dictionaries = (
-        load_dictionary_json(args.dict_json, normalizer)
-        if args.dict_json
-        else clean_dictionary_terms(BUILTIN_DICTIONARIES, normalizer)
-    )
+    dictionaries = clean_dictionary_terms(raw_dict, normalizer)
     target_words = flatten_dictionary_terms(dictionaries)
     with (args.out_dir / "dictionaries_used.json").open("w", encoding="utf-8") as f:
         json.dump(dictionaries, f, indent=2)
+
+    if args.groups:
+        groups = [normalize_group_value(group) for group in args.groups if normalize_group_value(group)]
+    else:
+        groups = discover_groups(args.csv, args.group_col, args.article_col)
+    if not groups:
+        raise ValueError(f"No values found for --group-col {args.group_col}.")
+    print(f"Phase 1 - analyzing {len(groups):,} {args.group_col} value(s).")
 
     print("Phase 2 - loading base fastText model.")
     model = load_fasttext_model(args.fasttext, limit=args.fasttext_limit)
@@ -822,43 +827,50 @@ def main() -> None:
         print(f"Phase 3 - loading existing matrix: {args.matrix}")
         pipeline.load_matrix(args.matrix)
     else:
-        print("Phase 3 - fitting custom 1964 news transformation matrix A.")
-        result = pipeline.fit_global_matrix(
-            csv_path=args.csv,
-            article_col=args.article_col,
-            chunksize=args.chunksize,
-            max_regression_words=args.max_regression_words,
-            max_global_alc_words=args.max_global_alc_words,
-        )
-        save_matrix_and_metadata(args.out_dir, result, args)
-        if args.save_global_alc or args.validation_words:
-            save_global_alc_vectors(args.out_dir, result)
+        loaded_existing_weights = False
+        if weights_path.exists():
+            print(f"Phase 3 - loading existing ALC weights: {weights_path}")
+            try:
+                pipeline.load_global_result(load_global_alc_bundle(weights_path))
+                loaded_existing_weights = True
+            except ValueError:
+                if args.alc_weights:
+                    raise
+                print(
+                    f"Existing {weights_path} is not a reusable weights bundle from this script; "
+                    "training a fresh yearly matrix."
+                )
+
+        if not loaded_existing_weights:
+            print(f"Phase 3 - fitting custom {args.year} news transformation matrix A.")
+            result = pipeline.fit_global_matrix(
+                csv_path=args.csv,
+                article_col=args.article_col,
+                chunksize=args.chunksize,
+                max_regression_words=args.max_regression_words,
+                max_global_alc_words=args.max_global_alc_words,
+            )
+            save_matrix_and_metadata(args.out_dir, result, args)
+            save_global_alc_bundle(weights_path, result)
 
     print("Phase 4 - generating localized ALC embeddings.")
     local_contexts = pipeline.local_context_vectors(
         csv_path=args.csv,
         article_col=args.article_col,
         group_col=args.group_col,
-        groups=args.groups,
+        groups=groups,
         target_words=target_words,
         chunksize=args.chunksize,
     )
-    transformed = save_local_word_embeddings(args.out_dir, pipeline, local_contexts, dictionaries)
+    transformed = transform_local_word_embeddings(pipeline, local_contexts, dictionaries)
 
-    print("Phase 5 - aggregating dictionaries and computing cosine scores.")
-    build_and_save_concept_vectors(args.out_dir, transformed)
+    print("Phase 5 - building final state-year bias table.")
+    concept_vectors = build_concept_vectors(transformed)
+    rows = build_bias_table_rows(concept_vectors, args.year)
+    table_path = args.out_dir / f"state_year_bias_table_{args.year}.csv"
+    write_csv_rows(table_path, rows, fieldnames=BIAS_TABLE_FIELDS)
 
-    if args.validation_words:
-        print("Phase 6 - saving nearest-neighbor validation.")
-        if pipeline.global_result is None:
-            raise ValueError("Validation needs a newly fitted global ALC vocabulary. Omit --matrix or rerun without it.")
-        cleaned_validation = []
-        for word in args.validation_words:
-            toks = normalizer.tokenize(word)
-            cleaned_validation.extend(toks[:1])
-        save_validation_neighbors(args.out_dir, pipeline, transformed, cleaned_validation, args.neighbor_topn)
-
-    print(f"Done. Outputs saved in: {args.out_dir}")
+    print(f"Done. Bias table saved in: {table_path}")
 
 
 if __name__ == "__main__":
